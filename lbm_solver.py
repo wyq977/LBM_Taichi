@@ -8,6 +8,9 @@ import matplotlib
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt
 
+SIGNAL_initalcondition = 1.0
+RADIUS = 20
+
 ti.init(arch=ti.gpu)
 
 @ti.data_oriented
@@ -56,11 +59,42 @@ class lbm_solver:
         return self.w[k] * self.rho[i, j] * (1.0 + 3.0 * eu + 4.5 * eu**2 - 1.5 * uv)
 
     @ti.kernel
+    def init_rho_center(self):
+        for i, j in self.rho:
+            self.rho[i, j] = 0.1
+
+        for i, j in ti.ndrange((0, self.nx), (0, self.ny)):
+            if ((ti.cast(i, ti.f32) - self.nx / 2) ** 2.0 + (ti.cast(j, ti.f32)
+                - self.nx / 2)**2.0 <= RADIUS**2.0):
+                self.rho[i, j] = SIGNAL_initalcondition
+                self.f_old[i,j][0] = SIGNAL_initalcondition / 9.0
+                self.f_old[i,j][1] = SIGNAL_initalcondition / 9.0
+                self.f_old[i,j][2] = SIGNAL_initalcondition / 9.0
+                self.f_old[i,j][3] = SIGNAL_initalcondition / 9.0
+                self.f_old[i,j][4] = SIGNAL_initalcondition / 9.0
+                self.f_old[i,j][5] = SIGNAL_initalcondition / 9.0
+                self.f_old[i,j][6] = SIGNAL_initalcondition / 9.0
+                self.f_old[i,j][7] = SIGNAL_initalcondition / 9.0
+                self.f_old[i,j][8] = SIGNAL_initalcondition / 9.0
+
+        # for i, j in ti.ndrange((190, 210), (190, 210)):
+        #     self.rho[i, j] = 1.0
+        #     self.f_old[i,j][0] = SIGNAL_initalcondition / 9.0
+        #     self.f_old[i,j][1] = SIGNAL_initalcondition / 9.0
+        #     self.f_old[i,j][2] = SIGNAL_initalcondition / 9.0
+        #     self.f_old[i,j][3] = SIGNAL_initalcondition / 9.0
+        #     self.f_old[i,j][4] = SIGNAL_initalcondition / 9.0
+        #     self.f_old[i,j][5] = SIGNAL_initalcondition / 9.0
+        #     self.f_old[i,j][6] = SIGNAL_initalcondition / 9.0
+        #     self.f_old[i,j][7] = SIGNAL_initalcondition / 9.0
+        #     self.f_old[i,j][8] = SIGNAL_initalcondition / 9.0
+
+    @ti.kernel
     def init(self):
         for i, j in self.rho:
             self.vel[i, j][0] = 0.0
             self.vel[i, j][1] = 0.0
-            self.rho[i, j] = 1.0
+            # self.rho[i, j] = 1.0
             self.mask[i, j] = 0.0
             for k in ti.static(range(9)):
                 self.f_new[i, j][k] = self.f_eq(i, j, k)
@@ -146,54 +180,63 @@ class lbm_solver:
                                         self.f_old[inb,jnb][k]
 
     def solve(self):
-        gui = ti.GUI('lbm solver', (self.nx, 2 * self.ny))
+        video_manager = ti.VideoManager(output_dir='fig', framerate=24, automatic_build=False)
+        # gui = ti.GUI('lbm solver', (self.nx, 2 * self.ny))
+        self.init_rho_center()
         self.init()
         for i in range(self.steps):
             self.collide_and_stream()
             self.update_macro_var()
             self.apply_bc()
-            ##  code fragment displaying vorticity is contributed by woclass
-            vel = self.vel.to_numpy()
-            ugrad = np.gradient(vel[:, :, 0])
-            vgrad = np.gradient(vel[:, :, 1])
-            vor = ugrad[1] - vgrad[0]
-            vel_mag = (vel[:, :, 0]**2.0+vel[:, :, 1]**2.0)**0.5
-            ## color map
-            colors = [(1, 1, 0), (0.953, 0.490, 0.016), (0, 0, 0),
-                (0.176, 0.976, 0.529), (0, 1, 1)]
-            my_cmap = matplotlib.colors.LinearSegmentedColormap.from_list(
-                'my_cmap', colors)
-            vor_img = cm.ScalarMappable(norm=matplotlib.colors.Normalize(
-                vmin=-0.02, vmax=0.02),cmap=my_cmap).to_rgba(vor)
-            vel_img = cm.plasma(vel_mag / 0.15)
-            img = np.concatenate((vor_img, vel_img), axis=1)
-            gui.set_image(img)
-            gui.show()
-            if (i % 1000 == 0):
-                print('Step: {:}'.format(i))
+            # ##  code fragment displaying vorticity is contributed by woclass
+            # vel = self.vel.to_numpy()
+            # ugrad = np.gradient(vel[:, :, 0])
+            # vgrad = np.gradient(vel[:, :, 1])
+            # vor = ugrad[1] - vgrad[0]
+            # vel_mag = (vel[:, :, 0]**2.0+vel[:, :, 1]**2.0)**0.5
+            # ## color map
+            # colors = [(1, 1, 0), (0.953, 0.490, 0.016), (0, 0, 0),
+            #     (0.176, 0.976, 0.529), (0, 1, 1)]
+            # my_cmap = matplotlib.colors.LinearSegmentedColormap.from_list(
+            #     'my_cmap', colors)
+            # vor_img = cm.ScalarMappable(norm=matplotlib.colors.Normalize(
+            #     vmin=-0.02, vmax=0.02),cmap=my_cmap).to_rgba(vor)
+            # vel_img = cm.plasma(vel_mag / 0.15)
+            # img = np.concatenate((vor_img, vel_img), axis=1)
+            # gui.set_image(img)
+            # gui.show()
+
+            # write density to
+            video_manager.write_frame(self.rho.to_numpy())
+
+            # if (i % 1000 == 0):
+            #     print('Step: {:}'.format(i))
                 # ti.imwrite((img[:,:,0:3]*255).astype(np.uint8), 'fig/karman_'+str(i).zfill(6)+'.png')
+
+        video_manager.make_video(gif=True, mp4=True)
+
 
     def pass_to_py(self):
         return self.vel.to_numpy()[:,:,0]
 
 if __name__ == '__main__':
-    flow_case = 0
+    flow_case = 1
     if (flow_case == 0):  # von Karman vortex street: Re = U*D/niu = 200
         lbm = lbm_solver(801, 201, 0.01, [0, 0, 1, 0],
              [[0.1, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
              1,[160.0, 100.0, 20.0])
         lbm.solve()
     elif (flow_case == 1):  # lid-driven cavity flow: Re = U*L/niu = 1000
-        lbm = lbm_solver(256, 256, 0.0255, [0, 0, 0, 0],
-                         [[0.0, 0.0], [0.1, 0.0], [0.0, 0.0], [0.0, 0.0]])
+        lbm = lbm_solver(400, 400, 0.0399, [0, 0, 0, 0],
+                         [[0.0, 0.0], [0.1, 0.0], [0.0, 0.0], [0.0, 0.0]], steps=5000)
         lbm.solve()
-        # compare with literature results
-        y_ref, u_ref = np.loadtxt('data/ghia1982.dat', unpack=True, skiprows=2, usecols=(0, 2))
-        fig, axes = plt.subplots(nrows=1, ncols=1, figsize=(4, 3), dpi=200)
-        axes.plot(np.linspace(0, 1.0, 256), lbm.pass_to_py()[256 // 2, :] / 0.1, 'b-', label='LBM')
-        axes.plot(y_ref, u_ref, 'rs', label='Ghia et al. 1982')
-        axes.legend()
-        axes.set_xlabel(r'Y')
-        axes.set_ylabel(r'U')
-        plt.tight_layout()
-        plt.show()
+        # # compare with literature results
+        # y_ref, u_ref = np.loadtxt('data/ghia1982.dat', unpack=True, skiprows=2, usecols=(0, 2))
+        # fig, axes = plt.subplots(nrows=1, ncols=1, figsize=(4, 3), dpi=200)
+        # axes.plot(np.linspace(0, 1.0, 256), lbm.pass_to_py()[256 // 2, :] / 0.1, 'b-', label='LBM')
+        # axes.plot(y_ref, u_ref, 'rs', label='Ghia et al. 1982')
+        # axes.legend()
+        # axes.set_xlabel(r'Y')
+        # axes.set_ylabel(r'U')
+        # plt.tight_layout()
+        # plt.show()
