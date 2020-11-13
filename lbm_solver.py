@@ -7,33 +7,42 @@ import numpy as np
 import matplotlib
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt
+import time
 
 SIGNAL_initalcondition = 1.0
+SIGNAL_production = 0.001
 RADIUS = 20
 
-ti.init(arch=ti.gpu)
 
 @ti.data_oriented
 class lbm_solver:
-    def __init__(self,
-                 nx, # domain size
-                 ny,
-                 niu, # viscosity of fluid
-                 bc_type, # [left,top,right,bottom] boundary conditions: 0 -> Dirichlet ; 1 -> Neumann
-                 bc_value, # if bc_type = 0, we need to specify the velocity in bc_value
-                 cy = 0, # whether to place a cylindrical obstacle
-                 cy_para = [0.0, 0.0, 0.0], # location and radius of the cylinder
-                 steps = 60000): # total steps to run
+    def __init__(
+        self,
+        nx,  # domain size
+        ny,
+        niu,  # viscosity of fluid
+        bc_type,  # [left,top,right,bottom] boundary conditions: 0 -> Dirichlet ; 1 -> Neumann
+        bc_value,  # if bc_type = 0, we need to specify the velocity in bc_value
+        cy=0,  # whether to place a cylindrical obstacle
+        cy_para=[0.0, 0.0, 0.0],  # location and radius of the cylinder
+        steps=60000,
+    ):  # total steps to run
         self.nx = nx  # by convention, dx = dy = dt = 1.0 (lattice units)
         self.ny = ny
         self.niu = niu
         self.tau = 3.0 * niu + 0.5
         self.inv_tau = 1.0 / self.tau
         self.rho = ti.field(dtype=ti.f32, shape=(nx, ny))
+        self.rho_c = ti.field(
+            dtype=ti.f32, shape=(nx, ny)
+        )  # density/concentration of another substrate
         self.vel = ti.Vector.field(2, dtype=ti.f32, shape=(nx, ny))
         self.mask = ti.field(dtype=ti.f32, shape=(nx, ny))
+        self.d_mask = ti.field(dtype=ti.f32, shape=(nx, ny))
         self.f_old = ti.Vector.field(9, dtype=ti.f32, shape=(nx, ny))
         self.f_new = ti.Vector.field(9, dtype=ti.f32, shape=(nx, ny))
+        self.cde_f_old = ti.Vector.field(9, dtype=ti.f32, shape=(nx, ny))
+        self.cde_f_new = ti.Vector.field(9, dtype=ti.f32, shape=(nx, ny))
         self.w = ti.field(dtype=ti.f32, shape=9)
         self.e = ti.field(dtype=ti.i32, shape=(9, 2))
         self.bc_type = ti.field(dtype=ti.i32, shape=4)
@@ -44,93 +53,128 @@ class lbm_solver:
         self.bc_value.from_numpy(np.array(bc_value, dtype=np.float32))
         self.cy_para.from_numpy(np.array(cy_para, dtype=np.float32))
         self.steps = steps
-        arr = np.array([ 4.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 36.0,
-            1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0], dtype=np.float32)
+        arr = np.array(
+            [
+                4.0 / 9.0,
+                1.0 / 9.0,
+                1.0 / 9.0,
+                1.0 / 9.0,
+                1.0 / 9.0,
+                1.0 / 36.0,
+                1.0 / 36.0,
+                1.0 / 36.0,
+                1.0 / 36.0,
+            ],
+            dtype=np.float32,
+        )
         self.w.from_numpy(arr)
-        arr = np.array([[0, 0], [1, 0], [0, 1], [-1, 0], [0, -1], [1, 1],
-                        [-1, 1], [-1, -1], [1, -1]], dtype=np.int32)
+        arr = np.array(
+            [
+                [0, 0],
+                [1, 0],
+                [0, 1],
+                [-1, 0],
+                [0, -1],
+                [1, 1],
+                [-1, 1],
+                [-1, -1],
+                [1, -1],
+            ],
+            dtype=np.int32,
+        )
         self.e.from_numpy(arr)
 
-    @ti.func # compute equilibrium distribution function
+    @ti.func  # compute equilibrium distribution function
     def f_eq(self, i, j, k):
-        eu = ti.cast(self.e[k, 0], ti.f32) * self.vel[i, j][0] + ti.cast(self.e[k, 1],
-            ti.f32) * self.vel[i, j][1]
-        uv = self.vel[i, j][0]**2.0 + self.vel[i, j][1]**2.0
-        return self.w[k] * self.rho[i, j] * (1.0 + 3.0 * eu + 4.5 * eu**2 - 1.5 * uv)
+        eu = (
+            ti.cast(self.e[k, 0], ti.f32) * self.vel[i, j][0]
+            + ti.cast(self.e[k, 1], ti.f32) * self.vel[i, j][1]
+        )
+        uv = self.vel[i, j][0] ** 2.0 + self.vel[i, j][1] ** 2.0
+        return self.w[k] * self.rho[i, j] * (1.0 + 3.0 * eu + 4.5 * eu ** 2 - 1.5 * uv)
 
-    @ti.kernel
-    def init_rho_center(self):
-        for i, j in self.rho:
-            self.rho[i, j] = 0.1
+    @ti.func  # compute equilibrium distribution function
+    def f_eq_cde(self, i, j, k):
+        eu = (
+            ti.cast(self.e[k, 0], ti.f32) * self.vel[i, j][0]
+            + ti.cast(self.e[k, 1], ti.f32) * self.vel[i, j][1]
+        )
+        uv = self.vel[i, j][0] ** 2.0 + self.vel[i, j][1] ** 2.0
+        return (
+            self.w[k] * self.rho_c[i, j] * (1.0 + 3.0 * eu + 4.5 * eu ** 2 - 1.5 * uv)
+        )
 
-        for i, j in ti.ndrange((0, self.nx), (0, self.ny)):
-            if ((ti.cast(i, ti.f32) - self.nx / 2) ** 2.0 + (ti.cast(j, ti.f32)
-                - self.nx / 2)**2.0 <= RADIUS**2.0):
-                self.rho[i, j] = SIGNAL_initalcondition
-                self.f_old[i,j][0] = SIGNAL_initalcondition / 9.0
-                self.f_old[i,j][1] = SIGNAL_initalcondition / 9.0
-                self.f_old[i,j][2] = SIGNAL_initalcondition / 9.0
-                self.f_old[i,j][3] = SIGNAL_initalcondition / 9.0
-                self.f_old[i,j][4] = SIGNAL_initalcondition / 9.0
-                self.f_old[i,j][5] = SIGNAL_initalcondition / 9.0
-                self.f_old[i,j][6] = SIGNAL_initalcondition / 9.0
-                self.f_old[i,j][7] = SIGNAL_initalcondition / 9.0
-                self.f_old[i,j][8] = SIGNAL_initalcondition / 9.0
-
-        # for i, j in ti.ndrange((190, 210), (190, 210)):
-        #     self.rho[i, j] = 1.0
-        #     self.f_old[i,j][0] = SIGNAL_initalcondition / 9.0
-        #     self.f_old[i,j][1] = SIGNAL_initalcondition / 9.0
-        #     self.f_old[i,j][2] = SIGNAL_initalcondition / 9.0
-        #     self.f_old[i,j][3] = SIGNAL_initalcondition / 9.0
-        #     self.f_old[i,j][4] = SIGNAL_initalcondition / 9.0
-        #     self.f_old[i,j][5] = SIGNAL_initalcondition / 9.0
-        #     self.f_old[i,j][6] = SIGNAL_initalcondition / 9.0
-        #     self.f_old[i,j][7] = SIGNAL_initalcondition / 9.0
-        #     self.f_old[i,j][8] = SIGNAL_initalcondition / 9.0
+    @ti.func
+    def reaction(self, i, j, k):
+        res = 0.0
+        # constant produciton at the source
+        if self.d_mask[i, j] == 1.0:
+            res = SIGNAL_production
+        return self.w[k] * res
 
     @ti.kernel
     def init(self):
         for i, j in self.rho:
             self.vel[i, j][0] = 0.0
             self.vel[i, j][1] = 0.0
-            # self.rho[i, j] = 1.0
+            self.rho[i, j] = 1.0
+            self.rho_c[i, j] = 0.0
             self.mask[i, j] = 0.0
+            self.d_mask[i, j] = 0.0
             for k in ti.static(range(9)):
                 self.f_new[i, j][k] = self.f_eq(i, j, k)
                 self.f_old[i, j][k] = self.f_new[i, j][k]
-            if(self.cy==1):
-                if ((ti.cast(i, ti.f32) - self.cy_para[0])**2.0 + (ti.cast(j, ti.f32)
-                    - self.cy_para[1])**2.0 <= self.cy_para[2]**2.0):
+                self.cde_f_new[i, j][k] = self.f_eq_cde(i, j, k)
+                self.cde_f_old[i, j][k] = self.cde_f_new[i, j][k]
+            if self.cy == 1:
+                if (ti.cast(i, ti.f32) - self.cy_para[0]) ** 2.0 + (
+                    ti.cast(j, ti.f32) - self.cy_para[1]
+                ) ** 2.0 <= self.cy_para[2] ** 2.0:
                     self.mask[i, j] = 1.0
 
+        for i, j in ti.ndrange((0, self.nx), (0, self.ny)):
+            if (ti.cast(i, ti.f32) - self.nx / 2) ** 2.0 + (
+                ti.cast(j, ti.f32) - self.nx / 2
+            ) ** 2.0 <= RADIUS ** 2.0:
+                self.rho_c[i, j] = SIGNAL_initalcondition
+                self.d_mask[i, j] = 1.0
+                for k in ti.static(range(9)):
+                    self.cde_f_old[i, j][k] = SIGNAL_initalcondition / 9.0
+
     @ti.kernel
-    def collide_and_stream(self): # lbm core equation
+    def collide_and_stream(self):  # lbm core equation
         for i, j in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
             for k in ti.static(range(9)):
                 ip = i - self.e[k, 0]
                 jp = j - self.e[k, 1]
-                self.f_new[i,j][k] = (1.0-self.inv_tau)*self.f_old[ip,jp][k] + \
-                                        self.f_eq(ip,jp,k)*self.inv_tau
+                self.f_new[i, j][k] = (1.0 - self.inv_tau) * self.f_old[ip, jp][
+                    k
+                ] + self.f_eq(ip, jp, k) * self.inv_tau
+                self.cde_f_new[i, j][k] = (
+                    (1.0 - self.inv_tau) * self.cde_f_old[ip, jp][k]
+                    + self.f_eq_cde(ip, jp, k) * self.inv_tau
+                    + self.reaction(i, j, k)
+                )
 
     @ti.kernel
-    def update_macro_var(self): # compute rho u v
+    def update_macro_var(self):  # compute rho u v
         for i, j in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
             self.rho[i, j] = 0.0
+            self.rho_c[i, j] = 0.0
             self.vel[i, j][0] = 0.0
             self.vel[i, j][1] = 0.0
             for k in ti.static(range(9)):
                 self.f_old[i, j][k] = self.f_new[i, j][k]
+                self.cde_f_old[i, j][k] = self.cde_f_new[i, j][k]
                 self.rho[i, j] += self.f_new[i, j][k]
-                self.vel[i, j][0] += (ti.cast(self.e[k, 0], ti.f32) *
-                                      self.f_new[i, j][k])
-                self.vel[i, j][1] += (ti.cast(self.e[k, 1], ti.f32) *
-                                      self.f_new[i, j][k])
+                self.rho_c[i, j] += self.cde_f_new[i, j][k]
+                self.vel[i, j][0] += ti.cast(self.e[k, 0], ti.f32) * self.f_new[i, j][k]
+                self.vel[i, j][1] += ti.cast(self.e[k, 1], ti.f32) * self.f_new[i, j][k]
             self.vel[i, j][0] /= self.rho[i, j]
             self.vel[i, j][1] /= self.rho[i, j]
 
     @ti.kernel
-    def apply_bc(self): # impose boundary conditions
+    def apply_bc(self):  # impose boundary conditions
         # left and right
         for j in ti.ndrange(1, self.ny - 1):
             # left: dr = 0; ibc = 0; jbc = j; inb = 1; jnb = j
@@ -150,16 +194,16 @@ class lbm_solver:
         # cylindrical obstacle
         # Note: for cuda backend, putting 'if statement' inside loops can be much faster!
         for i, j in ti.ndrange(self.nx, self.ny):
-            if (self.cy == 1 and self.mask[i, j] == 1):
+            if self.cy == 1 and self.mask[i, j] == 1:
                 self.vel[i, j][0] = 0.0  # velocity is zero at solid boundary
                 self.vel[i, j][1] = 0.0
                 inb = 0
                 jnb = 0
-                if (ti.cast(i,ti.f32) >= self.cy_para[0]):
+                if ti.cast(i, ti.f32) >= self.cy_para[0]:
                     inb = i + 1
                 else:
                     inb = i - 1
-                if (ti.cast(j,ti.f32) >= self.cy_para[1]):
+                if ti.cast(j, ti.f32) >= self.cy_para[1]:
                     jnb = j + 1
                 else:
                     jnb = j - 1
@@ -167,68 +211,112 @@ class lbm_solver:
 
     @ti.func
     def apply_bc_core(self, outer, dr, ibc, jbc, inb, jnb):
-        if (outer == 1):  # handle outer boundary
-            if (self.bc_type[dr] == 0):
+        if outer == 1:  # handle outer boundary
+            if self.bc_type[dr] == 0:
                 self.vel[ibc, jbc][0] = self.bc_value[dr, 0]
                 self.vel[ibc, jbc][1] = self.bc_value[dr, 1]
-            elif (self.bc_type[dr] == 1):
+            elif self.bc_type[dr] == 1:
                 self.vel[ibc, jbc][0] = self.vel[inb, jnb][0]
                 self.vel[ibc, jbc][1] = self.vel[inb, jnb][1]
         self.rho[ibc, jbc] = self.rho[inb, jnb]
         for k in ti.static(range(9)):
-            self.f_old[ibc,jbc][k] = self.f_eq(ibc,jbc,k) - self.f_eq(inb,jnb,k) + \
-                                        self.f_old[inb,jnb][k]
+            self.f_old[ibc, jbc][k] = (
+                self.f_eq(ibc, jbc, k)
+                - self.f_eq(inb, jnb, k)
+                + self.f_old[inb, jnb][k]
+            )
+            self.cde_f_old[ibc, jbc][k] = (
+                self.f_eq_cde(ibc, jbc, k)
+                - self.f_eq_cde(inb, jnb, k)
+                + self.cde_f_old[inb, jnb][k]
+            )
 
     def solve(self):
-        video_manager = ti.VideoManager(output_dir='fig', framerate=24, automatic_build=False)
-        # gui = ti.GUI('lbm solver', (self.nx, 2 * self.ny))
-        self.init_rho_center()
+        video_manager = ti.VideoManager(
+            output_dir="fig", framerate=24, automatic_build=False
+        )
+        # gui = ti.GUI("lbm solver", (self.nx, 2 * self.ny))
         self.init()
         for i in range(self.steps):
             self.collide_and_stream()
             self.update_macro_var()
             self.apply_bc()
-            # ##  code fragment displaying vorticity is contributed by woclass
-            # vel = self.vel.to_numpy()
-            # ugrad = np.gradient(vel[:, :, 0])
-            # vgrad = np.gradient(vel[:, :, 1])
-            # vor = ugrad[1] - vgrad[0]
-            # vel_mag = (vel[:, :, 0]**2.0+vel[:, :, 1]**2.0)**0.5
-            # ## color map
-            # colors = [(1, 1, 0), (0.953, 0.490, 0.016), (0, 0, 0),
-            #     (0.176, 0.976, 0.529), (0, 1, 1)]
-            # my_cmap = matplotlib.colors.LinearSegmentedColormap.from_list(
-            #     'my_cmap', colors)
-            # vor_img = cm.ScalarMappable(norm=matplotlib.colors.Normalize(
-            #     vmin=-0.02, vmax=0.02),cmap=my_cmap).to_rgba(vor)
-            # vel_img = cm.plasma(vel_mag / 0.15)
-            # img = np.concatenate((vor_img, vel_img), axis=1)
-            # gui.set_image(img)
-            # gui.show()
 
-            # write density to
-            video_manager.write_frame(self.rho.to_numpy())
+            if i % 500 == 0:
 
-            # if (i % 1000 == 0):
-            #     print('Step: {:}'.format(i))
-                # ti.imwrite((img[:,:,0:3]*255).astype(np.uint8), 'fig/karman_'+str(i).zfill(6)+'.png')
+                print("Step: {:}".format(i))
+                ##  code fragment displaying vorticity is contributed by woclass
+                vel = self.vel.to_numpy()
+                # ugrad = np.gradient(vel[:, :, 0])
+                # vgrad = np.gradient(vel[:, :, 1])
+                # vor = ugrad[1] - vgrad[0]
+                vel_mag = (vel[:, :, 0] ** 2.0 + vel[:, :, 1] ** 2.0) ** 0.5
+                vel_img = cm.plasma(vel_mag / 0.15)
+                ## color map
+                colors = [
+                    (1, 1, 0),
+                    (0.953, 0.490, 0.016),
+                    (0, 0, 0),
+                    (0.176, 0.976, 0.529),
+                    (0, 1, 1),
+                ]
+                my_cmap = matplotlib.colors.LinearSegmentedColormap.from_list(
+                    "my_cmap", colors
+                )
+                # vor_img = cm.ScalarMappable(
+                #     norm=matplotlib.colors.Normalize(vmin=-0.02, vmax=0.02), cmap=my_cmap
+                # ).to_rgba(vor)
+                # rho_img = cm.ScalarMappable(
+                #     norm=matplotlib.colors.Normalize(vmin=0, vmax=1), cmap=my_cmap
+                # ).to_rgba(self.rho.to_numpy())
+                cde_img = cm.ScalarMappable(
+                    norm=matplotlib.colors.LogNorm(vmin=1e-20, vmax=1), cmap="Spectral"
+                ).to_rgba(self.rho_c.to_numpy())
+                # img_l = np.concatenate((vor_img, vel_img), axis=1)
+                # img_r = np.concatenate((rho_img, cde_img), axis=1)
+                # img = np.concatenate((img_l, img_r), axis=0)
+                img = np.concatenate((vel_img, cde_img), axis=1)
+
+                # gui.set_image(img)
+                # gui.show()
+
+                # write density to
+                # gui.set_image(self.rho_c.to_numpy())
+                video_manager.write_frame(img)
+            # ti.imwrite((img[:,:,0:3]*255).astype(np.uint8), 'fig/karman_'+str(i).zfill(6)+'.png')
 
         video_manager.make_video(gif=True, mp4=True)
 
-
     def pass_to_py(self):
-        return self.vel.to_numpy()[:,:,0]
+        return self.vel.to_numpy()[:, :, 0]
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
+    start = time.perf_counter()
+
+    ti.init(cpu_max_num_threads=2)
+    # ti.init(arch=ti.gpu)
     flow_case = 1
-    if (flow_case == 0):  # von Karman vortex street: Re = U*D/niu = 200
-        lbm = lbm_solver(801, 201, 0.01, [0, 0, 1, 0],
-             [[0.1, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
-             1,[160.0, 100.0, 20.0])
+    if flow_case == 0:  # von Karman vortex street: Re = U*D/niu = 200
+        lbm = lbm_solver(
+            801,
+            201,
+            0.01,
+            [0, 0, 1, 0],
+            [[0.1, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+            1,
+            [160.0, 100.0, 20.0],
+        )
         lbm.solve()
-    elif (flow_case == 1):  # lid-driven cavity flow: Re = U*L/niu = 1000
-        lbm = lbm_solver(400, 400, 0.0399, [0, 0, 0, 0],
-                         [[0.0, 0.0], [0.1, 0.0], [0.0, 0.0], [0.0, 0.0]], steps=5000)
+    elif flow_case == 1:  # lid-driven cavity flow: Re = U*L/niu = 1000
+        lbm = lbm_solver(
+            400,
+            400,
+            0.0399,
+            [0, 0, 0, 0],
+            [[0.0, 0.0], [0.1, 0.0], [0.0, 0.0], [0.0, 0.0]],
+            steps=10000,
+        )
         lbm.solve()
         # # compare with literature results
         # y_ref, u_ref = np.loadtxt('data/ghia1982.dat', unpack=True, skiprows=2, usecols=(0, 2))
@@ -240,3 +328,6 @@ if __name__ == '__main__':
         # axes.set_ylabel(r'U')
         # plt.tight_layout()
         # plt.show()
+
+    end = time.perf_counter()
+    print(end - start)
